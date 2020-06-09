@@ -224,7 +224,8 @@ static void add_window(obs_property_t *p, HWND hwnd, add_window_cb callback)
 	dstr_free(&exe);
 }
 
-static bool check_window_valid(HWND window, enum window_search_mode mode)
+static bool check_window_valid(HWND window, enum window_search_mode mode,
+			bool allow_child_and_toolwindow)
 {
 	DWORD styles, ex_styles;
 	RECT rect;
@@ -237,9 +238,9 @@ static bool check_window_valid(HWND window, enum window_search_mode mode)
 	styles = (DWORD)GetWindowLongPtr(window, GWL_STYLE);
 	ex_styles = (DWORD)GetWindowLongPtr(window, GWL_EXSTYLE);
 
-	if (ex_styles & WS_EX_TOOLWINDOW)
+	if ((ex_styles & WS_EX_TOOLWINDOW) && !allow_child_and_toolwindow)
 		return false;
-	if (styles & WS_CHILD)
+	if ((styles & WS_CHILD) && !allow_child_and_toolwindow)
 		return false;
 	if (mode == EXCLUDE_MINIMIZED && (rect.bottom == 0 || rect.right == 0))
 		return false;
@@ -294,7 +295,7 @@ static HWND next_window(HWND window, enum window_search_mode mode, HWND *parent,
 		else
 			window = GetNextWindow(window, GW_HWNDNEXT);
 
-		if (!window || check_window_valid(window, mode))
+		if (!window || check_window_valid(window, mode, false))
 			break;
 	}
 
@@ -323,16 +324,15 @@ static HWND first_window(enum window_search_mode mode, HWND *parent,
 
 	*parent = NULL;
 
-	if (!check_window_valid(window, mode)) {
+	if (!check_window_valid(window, mode, false)) {
 		window = next_window(window, mode, parent, *use_findwindowex);
 
 		if (!window && *use_findwindowex) {
 			*use_findwindowex = false;
 
 			window = GetWindow(GetDesktopWindow(), GW_CHILD);
-			if (!check_window_valid(window, mode))
-				window = next_window(window, mode, parent,
-						     *use_findwindowex);
+			if (!check_window_valid(window, mode, false))
+				window = next_window(window, mode, parent, *use_findwindowex);
 		}
 	}
 
@@ -347,6 +347,63 @@ static HWND first_window(enum window_search_mode mode, HWND *parent,
 	return window;
 }
 
+bool is_desktop_icons_window(HWND window)
+{
+	wchar_t name[256];
+	HWND child = GetWindow(window, GW_CHILD);
+
+	while (child) {
+		name[0] = 0;
+
+		if (GetClassNameW(child, name, sizeof(name) / sizeof(wchar_t))) {
+			if (!wcscmp(name, L"SHELLDLL_DefView"))
+				return true;
+		}
+
+		child = GetNextWindow(child, GW_HWNDNEXT);
+	}
+
+	return false;
+}
+
+HWND get_window_between_shell_and_icons()
+{
+	HWND shell = GetShellWindow();
+	HWND between_shell_and_icons = GetNextWindow(shell, GW_HWNDPREV);
+	HWND icons = GetNextWindow(between_shell_and_icons, GW_HWNDPREV);
+	if (!icons)
+		return NULL;
+
+	if (!is_desktop_icons_window(icons))
+		return NULL;
+
+	return between_shell_and_icons;
+}
+
+void add_child_windows(HWND parent, obs_property_t *p,
+			enum window_search_mode mode, add_window_cb callback)
+{
+	HWND child = GetWindow(parent, GW_CHILD);
+	while (child) {
+		if (check_window_valid(child, mode, true)) {
+			add_window(p, child, callback);
+			child = GetNextWindow(child, GW_HWNDNEXT);
+		}
+	}
+}
+
+void add_windows_behind_desktop_icons(obs_property_t *p,
+			enum window_search_mode mode, add_window_cb callback)
+{
+	HWND shell = GetShellWindow();
+	if (shell)
+		add_child_windows(shell, p, mode, callback);
+
+	HWND between_shell_and_icons = get_window_between_shell_and_icons();
+	if (between_shell_and_icons)
+		add_child_windows(between_shell_and_icons, p, mode, callback);
+}
+
 void fill_window_list(obs_property_t *p, enum window_search_mode mode,
 		      add_window_cb callback)
 {
@@ -359,6 +416,8 @@ void fill_window_list(obs_property_t *p, enum window_search_mode mode,
 		add_window(p, window, callback);
 		window = next_window(window, mode, &parent, use_findwindowex);
 	}
+
+	add_windows_behind_desktop_icons(p, mode, callback);
 }
 
 static int window_rating(HWND window, enum window_priority priority,
@@ -405,6 +464,49 @@ static int window_rating(HWND window, enum window_priority priority,
 	return val;
 }
 
+HWND rate_child_windows(HWND parent, HWND best_window, int *best_rating,
+		enum window_search_mode mode, enum window_priority priority,
+		const char *class, const char *title, const char *exe)
+{
+	int rating;
+	HWND child = GetWindow(parent, GW_CHILD);
+		while (child) {
+			if (check_window_valid(child, mode, true)) {
+				rating = window_rating(child, priority, class, title, exe,
+						false);
+				if (rating < *best_rating) {
+					*best_rating = rating;
+					best_window = child;
+					if (rating == 0)
+						return best_window;
+				}
+			}
+			child = GetNextWindow(child, GW_HWNDNEXT);
+		}
+	return best_window;
+}
+
+HWND find_behind_desktop_icons(HWND best_window, int best_rating,
+		enum window_search_mode mode, enum window_priority priority,
+		const char *class, const char *title, const char *exe)
+{
+	HWND shell = GetShellWindow();
+	if (shell) {
+		best_window = rate_child_windows(shell, best_window, &best_rating,
+				mode, priority, class, title, exe);
+
+		if (best_rating == 0)
+			return best_window;
+	}
+
+	HWND between_shell_and_icons = get_window_between_shell_and_icons();
+	if (between_shell_and_icons)
+		best_window = rate_child_windows(between_shell_and_icons, best_window,
+				&best_rating, mode, priority, class, title, exe);
+
+	return best_window;
+}
+
 HWND find_window(enum window_search_mode mode, enum window_priority priority,
 		 const char *class, const char *title, const char *exe)
 {
@@ -427,11 +529,14 @@ HWND find_window(enum window_search_mode mode, enum window_priority priority,
 			best_rating = rating;
 			best_window = window;
 			if (rating == 0)
-				break;
+				return best_window;
 		}
 
 		window = next_window(window, mode, &parent, use_findwindowex);
 	}
+
+	best_window = find_behind_desktop_icons(best_window, best_rating, mode,
+			priority, class, title, exe);
 
 	return best_window;
 }
@@ -451,7 +556,7 @@ BOOL CALLBACK enum_windows_proc(HWND window, LPARAM lParam)
 {
 	struct top_level_enum_data *data = (struct top_level_enum_data *)lParam;
 
-	if (!check_window_valid(window, data->mode))
+	if (!check_window_valid(window, data->mode, false))
 		return TRUE;
 
 	int cloaked;
@@ -471,7 +576,7 @@ BOOL CALLBACK enum_windows_proc(HWND window, LPARAM lParam)
 	return rating > 0;
 }
 
-HWND find_window_top_level(enum window_search_mode mode,
+HWND find_window_wgc(enum window_search_mode mode,
 			   enum window_priority priority, const char *class,
 			   const char *title, const char *exe)
 {
@@ -488,5 +593,10 @@ HWND find_window_top_level(enum window_search_mode mode,
 	data.best_window = NULL;
 	data.best_rating = 0x7FFFFFFF;
 	EnumWindows(enum_windows_proc, (LPARAM)&data);
+	if (data.best_rating == 0)
+		return data.best_window;
+
+	data.best_window = find_behind_desktop_icons(data.best_window,
+			data.best_rating, mode, priority, class, title, exe);
 	return data.best_window;
 }

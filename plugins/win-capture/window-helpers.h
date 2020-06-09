@@ -31,7 +31,7 @@ extern void build_window_strings(const char *str, char **class, char **title,
 extern HWND find_window(enum window_search_mode mode,
 			enum window_priority priority, const char *class,
 			const char *title, const char *exe);
-extern HWND find_window_top_level(enum window_search_mode mode,
+extern HWND find_window_wgc(enum window_search_mode mode,
 				  enum window_priority priority,
 				  const char *class, const char *title,
 				  const char *exe);

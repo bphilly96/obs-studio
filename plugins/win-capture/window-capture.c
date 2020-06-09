@@ -407,7 +407,7 @@ static void wc_tick(void *data, float seconds)
 		wc->check_window_timer = 0.0f;
 
 		wc->window = (wc->method == METHOD_WGC)
-				     ? find_window_top_level(INCLUDE_MINIMIZED,
+				     ? find_window_wgc(INCLUDE_MINIMIZED,
 							     wc->priority,
 							     wc->class,
 							     wc->title,
